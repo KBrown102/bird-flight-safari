@@ -1,0 +1,1502 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>飞鸟 · 无限天际</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; overflow: hidden; background: #0b1026; }
+        canvas { display: block; }
+        #bg, #game { position: fixed; inset: 0; width: 100%; height: 100%; }
+        #bg { z-index: 0; }
+        #game { z-index: 1; pointer-events: none; }
+        #overlay {
+            position: fixed; inset: 0;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            background: rgba(11,16,38,0.82);
+            color: #f7f9ff; font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+            z-index: 10; transition: opacity 0.5s ease;
+            backdrop-filter: blur(6px);
+        }
+        #overlay h1 { font-size: clamp(32px, 6vw, 64px); font-weight: 300; letter-spacing: 0.15em; margin-bottom: 12px; }
+        #overlay p { font-size: clamp(14px, 2vw, 18px); opacity: 0.78; margin-bottom: 36px; line-height: 1.8; text-align: center; }
+        #startBtn {
+            padding: 14px 42px; font-size: 18px; letter-spacing: 0.2em;
+            border: 1px solid rgba(255,255,255,0.35); border-radius: 999px;
+            background: rgba(255,255,255,0.08); color: #fff; cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        #startBtn:hover { background: rgba(255,255,255,0.18); transform: translateY(-2px); }
+        #hint {
+            position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+            color: rgba(255,255,255,0.55); font-size: 13px; pointer-events: none;
+            font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+            text-align: center; line-height: 1.6; z-index: 5;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">
+        <h1>飞鸟 · 无限天际</h1>
+        <p>
+            ← → / A D 左右移动 · ↑ ↓ / W S 上下移动 · 空格 鸣叫<br>
+            俯瞰大地，自动向前飞行，穿越海洋、沙漠、草原、冰原与星空
+        </p>
+        <button id="startBtn">开始飞行</button>
+    </div>
+    <div id="hint">← → / A D 移动 · ↑ ↓ / W S 移动 · 空格 鸣叫</div>
+    <canvas id="bg"></canvas>
+    <canvas id="game"></canvas>
+
+    <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+
+    (() => {
+        const bgCanvas = document.getElementById('bg');
+        const gameCanvas = document.getElementById('game');
+        const ctx = gameCanvas.getContext('2d');
+        const overlay = document.getElementById('overlay');
+        const startBtn = document.getElementById('startBtn');
+        const hint = document.getElementById('hint');
+
+        let W, H, DPR;
+        function resize() {
+            DPR = window.devicePixelRatio || 1;
+            W = window.innerWidth;
+            H = window.innerHeight;
+            gameCanvas.width = W * DPR;
+            gameCanvas.height = H * DPR;
+            gameCanvas.style.width = W + 'px';
+            gameCanvas.style.height = H + 'px';
+            ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        }
+        window.addEventListener('resize', () => { resize(); resizeThree(); });
+        resize();
+
+        // ===== 世界配置 =====
+        let SECTION_WORLD = 4400;
+        const K = 2.2;
+        const AUTO_SPEED = 4.5;
+        const CAM_REF_Y = 0.58;
+
+        // 变量分段高度：星空(索引4)比其它段多一屏，实现“星空整体拉长一个屏幕”
+        let SEC_H = [SECTION_WORLD, SECTION_WORLD, SECTION_WORLD, SECTION_WORLD, SECTION_WORLD];
+        let SEC_CUM = [0, 0, 0, 0, 0];
+        let CYCLE_WORLD = 5 * SECTION_WORLD;
+        function rebuildSections() {
+            const EXTRA = Math.round(H * K);   // 一屏对应的世界高度
+            // 海洋(0) 与 星空(4) 各多一屏：海洋加长、星空拉长
+            SEC_H = [SECTION_WORLD + EXTRA, SECTION_WORLD, SECTION_WORLD, SECTION_WORLD, SECTION_WORLD + EXTRA];
+            SEC_CUM = [0];
+            for (let i = 1; i < 5; i++) SEC_CUM[i] = SEC_CUM[i - 1] + SEC_H[i - 1];
+            CYCLE_WORLD = SEC_CUM[4] + SEC_H[4];
+        }
+
+        function worldXOf(sx) { return (sx - W / 2) * K; }
+        function worldYOf(sy) { return scroll + (H * CAM_REF_Y - sy) * K; }
+        function screenXOf(wx) { return wx / K + W / 2; }
+        function screenYOf(wy) { return H * CAM_REF_Y - (wy - scroll) / K; }
+
+        function sceneIndexAt(wy) {
+            let w = ((wy % CYCLE_WORLD) + CYCLE_WORLD) % CYCLE_WORLD;
+            for (let i = 0; i < 5; i++) {
+                if (w < SEC_CUM[i] + SEC_H[i]) return i;
+            }
+            return 4;
+        }
+
+        function hex2rgb(h) {
+            return [parseInt(h.slice(1, 3), 16) / 255, parseInt(h.slice(3, 5), 16) / 255, parseInt(h.slice(5, 7), 16) / 255];
+        }
+        function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+        function smoothstep(a, b, x) { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); }
+
+        function hash2(x, y) {
+            let h = (Math.floor(x) * 73856093) ^ (Math.floor(y) * 19349663) ^ (Math.floor(x * 0.5) * 83492791);
+            h = (h ^ (h >>> 13)) >>> 0;
+            return h / 4294967295;
+        }
+
+        const SECTIONS = [
+            { name: '海洋', deep: '#0a3a5b', base: '#157fb8', light: '#3cc3f0' },
+            { name: '沙漠', deep: '#c99a52', base: '#e2c07a', light: '#f7ead0',
+              layers: ['#cf9f4f', '#e4c67a', '#f9edd0', '#f9edd0'] },
+            { name: '草原', deep: '#1e521e', base: '#3a8c3a', light: '#5db85d' },
+            { name: '冰原', deep: '#6a9fb5', base: '#a8cfe0', light: '#d8eefb' },
+            { name: '星空', deep: '#030511', base: '#070b22', light: '#14183a' }
+        ];
+
+        // ===== Three.js 底层背景 =====
+        let scene3d, camera3d, renderer3d;
+        let bgPlane, bgMat;
+        let grassLine, grassMat;
+        const MAX_GRASS = 16000;
+
+        function initThree() {
+            scene3d = new THREE.Scene();
+            camera3d = new THREE.OrthographicCamera(0, W, H, 0, -1, 1);
+            renderer3d = new THREE.WebGLRenderer({ canvas: bgCanvas, antialias: true, alpha: false });
+            renderer3d.setPixelRatio(DPR);
+            renderer3d.setSize(W, H);
+            renderer3d.setClearColor(new THREE.Color(SECTIONS[0].deep), 1);
+
+            buildBackground();
+            buildGrass();
+        }
+
+        // =====================================================================
+        //  背景片元着色器：场景过渡 + 沙漠分层（三次贝塞尔曲线分割）
+        // =====================================================================
+        const bgVertexShader = `
+            precision highp float;
+            attribute vec3 position;
+            attribute vec2 uv;
+            uniform mat4 projectionMatrix;
+            uniform mat4 modelViewMatrix;
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+        `;
+
+        const bgFragmentShader = `
+            precision highp float;
+            uniform float uTime;
+            uniform float uScroll;
+            uniform float uW, uH, uK, uCamRefY;
+            uniform float uSectionWorld;
+            uniform float uBlend;
+            uniform float uBorderAmp;
+            uniform float uDesertAmp;
+            uniform float uSecStart[5];
+            uniform float uSecH[5];
+            uniform vec3 uOceanDeep, uOceanBase, uOceanLight;
+            uniform vec3 uGrassDeep, uGrassBase, uGrassLight;
+            uniform vec3 uIceDeep, uIceBase, uIceLight;
+            uniform vec3 uSpaceDeep, uSpaceBase, uSpaceLight;
+            uniform vec3 uDesertLayer0, uDesertLayer1, uDesertLayer2, uDesertLayer3;
+            uniform vec4 uBorderCP0, uBorderCP1;
+            uniform vec4 uDesertCP0, uDesertCP1, uDesertCP2;
+            varying vec2 vUv;
+
+            float bezier(float t, vec4 cp) {
+                float t2 = t * t;
+                float t3 = t2 * t;
+                float omt = 1.0 - t;
+                float omt2 = omt * omt;
+                float omt3 = omt2 * omt;
+                return omt3 * cp.x + 3.0 * omt2 * t * cp.y + 3.0 * omt * t2 * cp.z + t3 * cp.w;
+            }
+
+            float screenYOf(float wy) {
+                return uH * uCamRefY - (wy - uScroll) / uK;
+            }
+
+            float sectionIndex(float wy) {
+                float n = 5.0;
+                float k = floor(wy / uSectionWorld);
+                return mod(k + 100.0, n);
+            }
+
+            float fracOf(float wy) {
+                return fract(wy / uSectionWorld);
+            }
+
+            vec3 gradient3(vec3 a, vec3 b, vec3 c, float t) {
+                return mix(mix(a, b, smoothstep(0.0, 0.5, t)), mix(b, c, smoothstep(0.5, 1.0, t)), t);
+            }
+
+            // 冰原分层：默认硬线条分层；仅「最暗(uIceDeep)↔最亮(uIceLight)」相交处柔和渐变
+            vec3 iceLayerColor(float yNorm) {
+                float x = vUv.x;
+                float bandY = yNorm * 4.5;
+                float wave = sin(x * 3.5 + bandY * 0.55) * 0.14
+                           + sin(x * 6.8 - bandY * 0.90) * 0.08
+                           + sin(x * 10.5 + bandY * 1.30) * 0.04
+                           + sin(x * 2.2 + bandY * 0.30) * 0.19;
+                float fy = bandY + wave;
+                float bi = mod(floor(fy), 3.0);
+                float local = fract(fy);
+                vec3 c;
+                if (bi < 0.5) c = uIceDeep;
+                else if (bi < 1.5) c = uIceBase;
+                else c = uIceLight;
+                if (bi > 1.5) {
+                    float t = smoothstep(0.70, 1.0, local);   // 最亮→最暗 末端柔和过渡
+                    c = mix(uIceLight, uIceDeep, t);
+                }
+                return c;
+            }
+
+            // 沙漠分层：默认硬线条分层；仅「最暗(uDesertLayer0)↔最亮(uDesertLayer2)」相交处柔和渐变
+            // 频率 5.0 使分层更密；相位 0.5 让靠近沙滩(底部 yNorm=0)的一侧落在最暗层
+            vec3 desertLayerColor(float yNorm) {
+                float x = vUv.x;
+                float bandY = yNorm * 5.0 + 0.5;
+                float wave = sin(x * 3.8 + bandY * 0.60) * 0.13
+                           + sin(x * 7.2 - bandY * 0.95) * 0.07
+                           + sin(x * 11.5 + bandY * 1.40) * 0.035
+                           + sin(x * 2.4 + bandY * 0.35) * 0.17;
+                float fy = bandY + wave;
+                float bi = mod(floor(fy), 3.0);
+                float local = fract(fy);
+                vec3 c;
+                if (bi < 0.5) c = uDesertLayer0;
+                else if (bi < 1.5) c = uDesertLayer1;
+                else c = uDesertLayer2;
+                if (bi > 1.5) {
+                    float t = smoothstep(0.70, 1.0, local);
+                    c = mix(uDesertLayer2, uDesertLayer0, t);
+                }
+                return c;
+            }
+
+            vec3 oceanToDesertColor(float frac) {
+                vec3 sand = vec3(0.96, 0.91, 0.78);
+                float sandMix = smoothstep(0.50, 0.86, frac);
+                vec3 ocean = gradient3(uOceanDeep, uOceanBase, uOceanLight, smoothstep(0.02, 0.80, frac));
+                vec3 beach = mix(ocean, sand, sandMix);
+                // 沙滩顶段(0.86→1.0)渐隐入沙漠暗区，消除亮沙滩与暗沙漠之间的硬边
+                float toDesert = smoothstep(0.86, 1.0, frac);
+                return mix(beach, uDesertLayer0, toDesert);
+            }
+
+            vec3 sectionColor(float idx, float frac) {
+                if (idx < 0.5) {
+                    return gradient3(uOceanDeep, uOceanBase, uOceanLight, smoothstep(0.02, 0.80, frac));
+                }
+                if (idx < 1.5) {
+                    return uDesertLayer2;
+                }
+                if (idx < 2.5) return gradient3(uGrassLight, uGrassBase, uGrassDeep, frac);
+                if (idx < 3.5) return iceLayerColor(frac);
+                return gradient3(uSpaceDeep, uSpaceBase, uSpaceLight, frac);
+            }
+
+            void main() {
+                float sy = uH * (1.0 - vUv.y);
+                float wy = uScroll + (uH * uCamRefY - sy) * uK;
+                float cyc = uSecStart[4] + uSecH[4];
+                float wyw = mod(wy, cyc);
+                if (wyw < 0.0) wyw += cyc;
+                float secIdx = 0.0;
+                float st = uSecStart[0];
+                float hgt = uSecH[0];
+                for (int i = 0; i < 5; i++) {
+                    if (wyw >= uSecStart[i] && wyw < uSecStart[i] + uSecH[i]) {
+                        secIdx = float(i);
+                        st = uSecStart[i];
+                        hgt = uSecH[i];
+                    }
+                }
+                float frac = (wyw - st) / hgt;
+
+                float t = vUv.x;
+                float bezierTop = (bezier(t, uBorderCP0) - 0.5) * uBorderAmp;
+                float bezierBot = (bezier(t, uBorderCP1) - 0.5) * uBorderAmp;
+
+                float cycStart = wy - wyw;   // 当前圈对应的全局起点 world Y（跨圈后也正确）
+                float botG = cycStart + st;
+                float topG = cycStart + st + hgt;
+                float syBotK = screenYOf(botG) + bezierBot;
+                float syTopK = screenYOf(topG) + bezierTop;
+                float prevH = uSecH[0];
+                float nextH = uSecH[0];
+                for (int i = 0; i < 5; i++) {
+                    if (float(i) == mod(secIdx - 1.0 + 5.0, 5.0)) prevH = uSecH[i];
+                    if (float(i) == mod(secIdx + 1.0 + 5.0, 5.0)) nextH = uSecH[i];
+                }
+                float syBotKm1 = screenYOf(cycStart + st - prevH) + bezierBot;
+                float syTopKm1 = syBotK;
+                float syTopKp1 = screenYOf(cycStart + st + hgt + nextH) + bezierTop;
+                float syBotKp1 = syTopK;
+                // 贝塞尔归一化位置：用带波浪偏移的边界框，让沙带贴合波浪边界
+                float fracB = clamp((syBotK - sy) / max(syBotK - syTopK, 0.001), 0.0, 1.0);
+
+                float dTopK = sy - syTopK;
+                float dBotK = syBotK - sy;
+                float dTopKm1 = sy - syTopKm1;
+                float dBotKm1 = syBotKm1 - sy;
+                float dTopKp1 = sy - syTopKp1;
+                float dBotKp1 = syBotKp1 - sy;
+
+                float wK = smoothstep(0.0, uBlend, dTopK) * smoothstep(0.0, uBlend, dBotK);
+                float wKm1 = smoothstep(0.0, uBlend, dTopKm1) * smoothstep(0.0, uBlend, dBotKm1);
+                float wKp1 = smoothstep(0.0, uBlend, dTopKp1) * smoothstep(0.0, uBlend, dBotKp1);
+
+                // 相邻分段的屏幕空间占比：0=段底，1=段顶（与世界坐标 frac 同向，不再假等高）
+                float fracKm1 = clamp((syBotKm1 - sy) / max(syBotKm1 - syBotK, 0.001), 0.0, 1.0);
+                float fracKp1 = clamp((syTopK - sy) / max(syTopK - syTopKp1, 0.001), 0.0, 1.0);
+
+                vec3 colK = sectionColor(secIdx, frac);
+                vec3 colKm1 = sectionColor(mod(secIdx - 1.0 + 5.0, 5.0), fracKm1);
+                vec3 colKp1 = sectionColor(mod(secIdx + 1.0, 5.0), fracKp1);
+
+                if (secIdx < 0.5) colK = oceanToDesertColor(fracB);
+                if (mod(secIdx - 1.0 + 5.0, 5.0) < 0.5) colKm1 = oceanToDesertColor(fracKm1);
+                if (mod(secIdx + 1.0, 5.0) < 0.5) colKp1 = oceanToDesertColor(fracKp1);
+
+                if (secIdx > 0.5 && secIdx < 1.5) {
+                    float yNorm = 1.0 - clamp((sy - syTopK) / (syBotK - syTopK + 0.001), 0.0, 1.0);
+                    colK = desertLayerColor(yNorm);
+                }
+                if (secIdx - 1.0 > 0.5 && secIdx - 1.0 < 1.5) {
+                    float yNorm = 1.0 - clamp((sy - syTopKm1) / (syBotKm1 - syTopKm1 + 0.001), 0.0, 1.0);
+                    colKm1 = desertLayerColor(yNorm);
+                }
+                if (secIdx + 1.0 > 0.5 && secIdx + 1.0 < 1.5) {
+                    float yNorm = 1.0 - clamp((sy - syTopKp1) / (syBotKp1 - syTopKp1 + 0.001), 0.0, 1.0);
+                    colKp1 = desertLayerColor(yNorm);
+                }
+
+                if (secIdx > 2.5 && secIdx < 3.5) {
+                    float yNorm = 1.0 - clamp((sy - syTopK) / (syBotK - syTopK + 0.001), 0.0, 1.0);
+                    colK = iceLayerColor(yNorm);
+                }
+                if (secIdx - 1.0 > 2.5 && secIdx - 1.0 < 3.5) {
+                    float yNorm = 1.0 - clamp((sy - syTopKm1) / (syBotKm1 - syTopKm1 + 0.001), 0.0, 1.0);
+                    colKm1 = iceLayerColor(yNorm);
+                }
+                if (secIdx + 1.0 > 2.5 && secIdx + 1.0 < 3.5) {
+                    float yNorm = 1.0 - clamp((sy - syTopKp1) / (syBotKp1 - syTopKp1 + 0.001), 0.0, 1.0);
+                    colKp1 = iceLayerColor(yNorm);
+                }
+
+                float sum = wK + wKm1 + wKp1;
+                vec3 col = (colK * wK + colKm1 * wKm1 + colKp1 * wKp1) / max(sum, 0.0001);
+
+                if (secIdx > 3.5) {
+                    float neb = sin(vUv.x * 8.0) * sin(vUv.y * 6.0);
+                    col = mix(col, vec3(0.05, 0.04, 0.15), smoothstep(-0.5, 0.8, neb) * 0.25);
+                }
+
+                gl_FragColor = vec4(col, 1.0);
+            }
+        `;
+
+        function buildBackground() {
+            SECTION_WORLD = Math.round(H * K * 2.5);
+            rebuildSections();
+            if (bgPlane) { scene3d.remove(bgPlane); if (bgMat) bgMat.dispose(); }
+            const geo = new THREE.PlaneGeometry(W, H);
+            bgMat = new THREE.RawShaderMaterial({
+                vertexShader: bgVertexShader,
+                fragmentShader: bgFragmentShader,
+                side: THREE.DoubleSide,
+                uniforms: {
+                    uTime: { value: 0 },
+                    uScroll: { value: 0 },
+                    uW: { value: W },
+                    uH: { value: H },
+                    uK: { value: K },
+                    uCamRefY: { value: CAM_REF_Y },
+                    uSectionWorld: { value: SECTION_WORLD },
+                    uSecStart: { value: new Float32Array(SEC_CUM) },
+                    uSecH: { value: new Float32Array(SEC_H) },
+                    uBlend: { value: 110.0 },
+                    uBorderAmp: { value: 100.0 },
+                    uDesertAmp: { value: 0.14 },
+                    uOceanDeep: { value: new THREE.Color(SECTIONS[0].deep) },
+                    uOceanBase: { value: new THREE.Color(SECTIONS[0].base) },
+                    uOceanLight: { value: new THREE.Color(SECTIONS[0].light) },
+                    uGrassDeep: { value: new THREE.Color(SECTIONS[2].deep) },
+                    uGrassBase: { value: new THREE.Color(SECTIONS[2].base) },
+                    uGrassLight: { value: new THREE.Color(SECTIONS[2].light) },
+                    uIceDeep: { value: new THREE.Color(SECTIONS[3].deep) },
+                    uIceBase: { value: new THREE.Color(SECTIONS[3].base) },
+                    uIceLight: { value: new THREE.Color(SECTIONS[3].light) },
+                    uSpaceDeep: { value: new THREE.Color(SECTIONS[4].deep) },
+                    uSpaceBase: { value: new THREE.Color(SECTIONS[4].base) },
+                    uSpaceLight: { value: new THREE.Color(SECTIONS[4].light) },
+                    uDesertLayer0: { value: new THREE.Color(SECTIONS[1].layers[0]) },
+                    uDesertLayer1: { value: new THREE.Color(SECTIONS[1].layers[1]) },
+                    uDesertLayer2: { value: new THREE.Color(SECTIONS[1].layers[2]) },
+                    uDesertLayer3: { value: new THREE.Color(SECTIONS[1].layers[2]) },
+                    uBorderCP0: { value: new THREE.Vector4(0.35, 0.62, 0.45, 0.70) },
+                    uBorderCP1: { value: new THREE.Vector4(0.55, 0.42, 0.65, 0.32) },
+                    uDesertCP0: { value: new THREE.Vector4(0.25, 0.45, 0.55, 0.35) },
+                    uDesertCP1: { value: new THREE.Vector4(0.65, 0.55, 0.35, 0.75) },
+                    uDesertCP2: { value: new THREE.Vector4(0.40, 0.70, 0.50, 0.60) }
+                }
+            });
+            bgPlane = new THREE.Mesh(geo, bgMat);
+            bgPlane.position.set(W / 2, H / 2, 0);
+            bgPlane.frustumCulled = false;
+            scene3d.add(bgPlane);
+        }
+
+        function resizeThree() {
+            camera3d.right = W; camera3d.top = H; camera3d.updateProjectionMatrix();
+            renderer3d.setPixelRatio(DPR); renderer3d.setSize(W, H);
+            buildBackground();
+            buildGrass();
+        }
+
+        // =====================================================================
+        //  草原 WebGL：线条实例 + 自定义 shader（下深上浅、流苏摆动、被推歪）
+        // =====================================================================
+        const grassVertexShader = `
+            precision highp float;
+            uniform float uW, uH, uK, uScroll, uCamRefY, uTime;
+            attribute float aT;
+            attribute vec2 aWorld;
+            attribute float aHeight;
+            attribute float aRand;
+            attribute vec2 aPush;
+            attribute vec3 aBase, aTip;
+            varying float vT;
+            varying vec3 vBase, vTip;
+            varying float vAlpha;
+
+            void main() {
+                float worldX = aWorld.x;
+                float worldY = aWorld.y;
+                // 草根固定：所有摆动只施加在 t > 0 的部分，t=0 保持 (worldX, worldY)
+                float bend = sin(worldX * 0.018 + worldY * 0.011 - uTime * 1.7 + aRand * 6.283) * 2.6
+                           + sin(worldX * 0.011 - worldY * 0.006 - uTime * 0.85 + aRand * 3.141) * 1.4;
+                float tipX = aPush.x + bend;
+                float tipY = aPush.y + aHeight;   // 草尖在草根上方：草从地面向上长（修正整体长反）
+                float one_t = 1.0 - aT;
+                // 控制点随 t 非线性偏移，让草根附近几乎不动，中段以上才明显摆动
+                float bendFactor = aT * aT * (3.0 - 2.0 * aT);
+                float ctrlX = worldX + tipX * (0.18 + 0.22 * aT);
+                float ctrlY = worldY + tipY * (0.25 + 0.35 * aT);
+                float wx = worldX + tipX * bendFactor;
+                float wy = worldY + tipY * bendFactor + bend * 0.12 * aT * aT;
+                float sx = wx / uK + uW / 2.0;
+                float sy = uH * uCamRefY - (wy - uScroll) / uK;
+                gl_Position = vec4((sx / uW) * 2.0 - 1.0, (sy / uH) * -2.0 + 1.0, 0.0, 1.0);
+                vT = aT;
+                vBase = aBase;
+                vTip = aTip;
+                vAlpha = 0.55 + aRand * 0.3;
+            }
+        `;
+
+        const grassFragmentShader = `
+            precision highp float;
+            varying float vT;
+            varying vec3 vBase, vTip;
+            varying float vAlpha;
+            void main() {
+                vec3 col = mix(vBase, vTip, vT);
+                float a = mix(vAlpha, vAlpha * 0.45, vT);
+                if (a < 0.02) discard;
+                gl_FragColor = vec4(col, a);
+            }
+        `;
+
+        function buildGrass() {
+            const count = MAX_GRASS;
+            const tArr = new Float32Array(count * 2);
+            const positions = new Float32Array(count * 2 * 3); // dummy vec3 for Three.js
+            const world = new Float32Array(count * 2 * 2);
+            const rand = new Float32Array(count * 2);
+            const height = new Float32Array(count * 2);
+            const push = new Float32Array(count * 2 * 2);
+            const baseCol = new Float32Array(count * 2 * 3);
+            const tipCol = new Float32Array(count * 2 * 3);
+            for (let i = 0; i < count; i++) {
+                tArr[i * 2] = 0;
+                tArr[i * 2 + 1] = 1;
+            }
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geo.setAttribute('aT', new THREE.BufferAttribute(tArr, 1));
+            geo.setAttribute('aWorld', new THREE.BufferAttribute(world, 2));
+            geo.setAttribute('aRand', new THREE.BufferAttribute(rand, 1));
+            geo.setAttribute('aHeight', new THREE.BufferAttribute(height, 1));
+            geo.setAttribute('aPush', new THREE.BufferAttribute(push, 2));
+            geo.setAttribute('aBase', new THREE.BufferAttribute(baseCol, 3));
+            geo.setAttribute('aTip', new THREE.BufferAttribute(tipCol, 3));
+            grassMat = new THREE.RawShaderMaterial({
+                vertexShader: grassVertexShader,
+                fragmentShader: grassFragmentShader,
+                uniforms: {
+                    uW: { value: W }, uH: { value: H }, uK: { value: K },
+                    uScroll: { value: 0 }, uCamRefY: { value: CAM_REF_Y }, uTime: { value: 0 }
+                },
+                transparent: true,
+                depthTest: false,
+                depthWrite: false
+            });
+            if (grassLine) { scene3d.remove(grassLine); grassMat.dispose(); }
+            grassLine = new THREE.LineSegments(geo, grassMat);
+            grassLine.frustumCulled = false;
+            scene3d.add(grassLine);
+        }
+
+        function updateGrass() {
+            const GW = 22, GH = 30;
+            const wyTop = worldYOf(-80), wyBot = worldYOf(H + 80);
+            const wxL = worldXOf(-80), wxR = worldXOf(W + 80);
+            const gy0 = Math.floor(wyBot / GH) * GH, gy1 = Math.ceil(wyTop / GH) * GH;
+            const gx0 = Math.floor(wxL / GW) * GW, gx1 = Math.ceil(wxR / GW) * GW;
+            const pushSrc = [{ x: player.screenX, y: player.screenY, vx: player.svx, vy: player.svy }];
+            for (const b of companions) pushSrc.push({ x: b.x, y: b.y, vx: b.vx, vy: b.vy });
+
+            const pos = grassLine.geometry.attributes.aT.array;
+            const world = grassLine.geometry.attributes.aWorld.array;
+            const randArr = grassLine.geometry.attributes.aRand.array;
+            const heightArr = grassLine.geometry.attributes.aHeight.array;
+            const pushArr = grassLine.geometry.attributes.aPush.array;
+            const baseArr = grassLine.geometry.attributes.aBase.array;
+            const tipArr = grassLine.geometry.attributes.aTip.array;
+
+            let idx = 0;
+            for (let wy = gy0; wy <= gy1 && idx < MAX_GRASS; wy += GH) {
+                if (SECTIONS[sceneIndexAt(wy)].name !== '草原') continue;
+                for (let wx = gx0; wx <= gx1 && idx < MAX_GRASS; wx += GW) {
+                    const r = hash2(Math.floor(wx / GW), Math.floor(wy / GH));
+                    // 每格概率更高，更密但更随机
+                    if (r < 0.04) continue;
+                    const offX = (hash2(wx * 0.31, wy * 0.17) - 0.5) * GW * 1.85;
+                    const offY = (hash2(wx * 0.17, wy * 0.31) - 0.5) * GH * 1.85;
+                    const wxp = wx + offX, wyp = wy + offY;
+                    const h = 28 + r * 44 + hash2(wx, wy) * 30;
+                    let pushX = 0, pushY = 0;
+                    const sx = screenXOf(wxp), sy = screenYOf(wyp);
+                    for (const s of pushSrc) {
+                        const dx = sx - s.x, dy = sy - s.y;
+                        const d = Math.hypot(dx, dy);
+                        const Rp = 135;
+                        if (d < Rp && d > 0.5) {
+                            const f = 1 - d / Rp;
+                            // 草尖朝远离飞鸟方向被推开：水平(dx)与竖直(dy)均为「草-鸟」同向（根固定、尖自由弯曲）
+                            pushX += (dx / d) * f * 30 + s.vx * f * 2.0;
+                            pushY += (dy / d) * f * 18 + s.vy * f * 2.0;
+                        }
+                    }
+                    pushY = Math.max(Math.min(pushY, h * 0.5), -h * 0.5);
+                    const gVal = Math.floor(60 + r * 135);
+                    // 配色：根为暗色、草尖为亮色（草从地面向上长，根在下固定、尖在上自由弯曲）
+                    const baseC = [0.05 + gVal * 0.00065, 0.15 + gVal * 0.00115, 0.04 + gVal * 0.0005];
+                    const tipC = [0.30 + gVal * 0.0017, 0.62 + gVal * 0.0019, 0.23 + gVal * 0.00105];
+                    for (let v = 0; v < 2; v++) {
+                        const i = idx * 2 + v;
+                        pos[i] = v;
+                        world[i * 2] = wxp;
+                        world[i * 2 + 1] = wyp;
+                        randArr[i] = r;
+                        heightArr[i] = h;
+                        pushArr[i * 2] = pushX;
+                        pushArr[i * 2 + 1] = pushY;
+                        baseArr[i * 3] = baseC[0];
+                        baseArr[i * 3 + 1] = baseC[1];
+                        baseArr[i * 3 + 2] = baseC[2];
+                        tipArr[i * 3] = tipC[0];
+                        tipArr[i * 3 + 1] = tipC[1];
+                        tipArr[i * 3 + 2] = tipC[2];
+                    }
+                    idx++;
+                }
+            }
+            grassLine.geometry.setDrawRange(0, idx * 2);
+            grassLine.geometry.attributes.aT.needsUpdate = true;
+            grassLine.geometry.attributes.aWorld.needsUpdate = true;
+            grassLine.geometry.attributes.aRand.needsUpdate = true;
+            grassLine.geometry.attributes.aHeight.needsUpdate = true;
+            grassLine.geometry.attributes.aPush.needsUpdate = true;
+            grassLine.geometry.attributes.aBase.needsUpdate = true;
+            grassLine.geometry.attributes.aTip.needsUpdate = true;
+        }
+
+        // ===== 音频：铜盂空灵鸣叫 =====
+        let audioCtx = null;
+        function ensureAudio() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+        }
+        function makeReverb() {
+            const rate = audioCtx.sampleRate;
+            const length = rate * 2.0;
+            const impulse = audioCtx.createBuffer(2, length, rate);
+            for (let ch = 0; ch < 2; ch++) {
+                const data = impulse.getChannelData(ch);
+                for (let i = 0; i < length; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, 2.5);
+            }
+            const convolver = audioCtx.createConvolver();
+            convolver.buffer = impulse;
+            return convolver;
+        }
+        let reverbNode = null;
+        function playBirdSong(pitch = 1, delay = 0) {
+            if (!audioCtx) return;
+            const t = audioCtx.currentTime + delay;
+            const fundamental = 280 * pitch;
+            const harmonics = [1, 2.5, 4.8, 7.1];
+            const masterGain = audioCtx.createGain();
+            masterGain.gain.setValueAtTime(0, t);
+            masterGain.gain.linearRampToValueAtTime(0.55, t + 0.02);
+            masterGain.gain.exponentialRampToValueAtTime(0.001, t + 1.9);
+            if (!reverbNode) reverbNode = makeReverb();
+            const dry = audioCtx.createGain(); dry.gain.value = 0.35;
+            const wet = audioCtx.createGain(); wet.gain.value = 0.65;
+            masterGain.connect(dry); dry.connect(audioCtx.destination);
+            masterGain.connect(wet); wet.connect(reverbNode); reverbNode.connect(audioCtx.destination);
+            harmonics.forEach((h, idx) => {
+                const osc = audioCtx.createOscillator();
+                const g = audioCtx.createGain();
+                osc.type = idx === 0 ? 'sine' : 'triangle';
+                osc.frequency.setValueAtTime(fundamental * h, t);
+                osc.frequency.exponentialRampToValueAtTime(fundamental * h * 0.9, t + 0.35);
+                g.gain.setValueAtTime(0, t);
+                g.gain.linearRampToValueAtTime(1 / harmonics.length, t + 0.01 + idx * 0.015);
+                g.gain.exponentialRampToValueAtTime(0.001, t + 1.2 + idx * 0.12);
+                osc.connect(g); g.connect(masterGain);
+                osc.start(t); osc.stop(t + 2.2);
+            });
+            const strike = audioCtx.createOscillator();
+            const sg = audioCtx.createGain();
+            strike.type = 'sine';
+            strike.frequency.setValueAtTime(95, t);
+            strike.frequency.exponentialRampToValueAtTime(42, t + 0.12);
+            sg.gain.setValueAtTime(0, t);
+            sg.gain.linearRampToValueAtTime(0.9, t + 0.005);
+            sg.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+            strike.connect(sg); sg.connect(masterGain);
+            strike.start(t); strike.stop(t + 0.25);
+        }
+
+        // ===== 输入（方向键 + WASD） =====
+        const keys = { left: false, right: false, up: false, down: false };
+        function setKey(e, val) {
+            const k = e.code;
+            if (k === 'ArrowLeft' || k === 'KeyA') { keys.left = val; e.preventDefault(); }
+            else if (k === 'ArrowRight' || k === 'KeyD') { keys.right = val; e.preventDefault(); }
+            else if (k === 'ArrowUp' || k === 'KeyW') { keys.up = val; e.preventDefault(); }
+            else if (k === 'ArrowDown' || k === 'KeyS') { keys.down = val; e.preventDefault(); }
+            else if (k === 'Space') { if (val && !e.repeat) player.chime(); e.preventDefault(); }
+        }
+        window.addEventListener('keydown', e => setKey(e, true));
+        window.addEventListener('keyup', e => setKey(e, false));
+
+        // ===== 实体 =====
+        let scroll = 0;
+
+        const player = {
+            screenX: W / 2,
+            screenY: H * 0.58,
+            svx: 0, svy: 0,
+            size: 30, wingSpan: 132,
+            sizeScale: 1, pitch: 0, bank: 0, glide: 0, ctrlGlide: 0, climb: 0,
+            flap: 0, wingSpeed: 0.10,
+            tailPhase: 0, tailSpeed: 0.070,
+            dragX: 0, dragY: 0,
+            trail: [],
+            chime() {
+                playBirdSong(1, 0);
+                waves.push({ x: this.screenX, y: this.screenY - this.size, r: 0, a: 1, life: 1, fromPlayer: true });
+            },
+            update() {
+                const accel = 0.9, damp = 0.86, maxV = 11;
+                if (keys.left) this.svx -= accel;
+                if (keys.right) this.svx += accel;
+                if (keys.up) this.svy -= accel;
+                if (keys.down) this.svy += accel;
+                this.svx *= damp; this.svy *= damp;
+                this.svx = clamp(this.svx, -maxV, maxV);
+                this.svy = clamp(this.svy, -maxV, maxV);
+                this.screenX += this.svx;
+                this.screenY += this.svy;
+                this.screenX = clamp(this.screenX, this.size, W - this.size);
+                this.screenY = clamp(this.screenY, 70, H - 80);
+                this.flap += this.wingSpeed + Math.abs(this.svx) * 0.002;
+                this.tailPhase += this.tailSpeed + Math.abs(this.svx) * 0.0015;
+                this.dragX = -this.svx * 1.6;
+                this.dragY = -this.svy * 1.6;
+                // 左右转向：横移速度驱动机身侧倾（朝向扭过去一点），松手自动回正
+                const targetBank = clamp(this.svx * 0.038, -0.42, 0.42);
+                this.bank += (targetBank - this.bank) * 0.12;
+                this.trail.push({ x: this.screenX, y: this.screenY + this.size * 0.3 });
+                if (this.trail.length > 14) this.trail.shift();
+            }
+        };
+
+        const companions = [];
+        function initCompanions() {
+            companions.length = 0;
+            for (let i = 0; i < 4; i++) {
+                const ang = (i / 4) * Math.PI * 2;
+                const rad = 120 + Math.random() * 60;
+                companions.push({
+                    x: W / 2 + Math.cos(ang) * rad,
+                    y: H * 0.45 + Math.sin(ang) * rad * 0.6,
+                    size: 22 + Math.random() * 6,
+                    wingSpan: 85 + Math.random() * 25,
+                    flap: Math.random() * Math.PI * 2,
+                    wingSpeed: 0.09 + Math.random() * 0.03,
+                    tailPhase: Math.random() * Math.PI * 2,
+                    tailSpeed: 0.055 + Math.random() * 0.02,
+                    vx: 0, vy: 0, bank: 0,
+                    color: '#fff8e7',
+                    replyTimer: 0
+                });
+            }
+        }
+        initCompanions();
+
+        const waves = [];
+
+        // ===== 场景元素：按「真实分段世界范围」生成（修复跨圈错位 / 越界到邻场景的 bug） =====
+        // 旧实现用固定 SECTION_WORLD 窗口划分，但分段高度可变（海洋/星空各多一屏 EXTRA），
+        // 固定窗口边界与真实分段边界逐圈错位，导致雪花/光点/星芒被生成到相邻场景里。
+        // 现改为以 SEC_CUM/SEC_H + 循环编号定位每段的真实世界区间，元素内缩 EDGE_MARGIN 不越界。
+        const elemPool = new Map();
+        const OCEAN_DENSITY = 0.00005;   // 光点密度：约为原来一半，明显变稀
+        const SNOW_DENSITY = 0.000038;
+        const EDGE_MARGIN = Math.round(H * K * 0.16); // 距分段边界的世界内缩，避开贝塞尔过渡带
+
+        function sectionRange(i, cyc) {
+            const s0 = cyc * CYCLE_WORLD + SEC_CUM[i];
+            const s1 = s0 + SEC_H[i];
+            return [s0, s1];
+        }
+        // 返回与可见世界区间 [wyA, wyB] 相交的真实分段（含循环编号）
+        function visibleSectionRanges(wyA, wyB) {
+            const out = [];
+            const c0 = Math.floor(wyA / CYCLE_WORLD);
+            for (let cyc = c0; cyc <= c0 + 1; cyc++) {
+                for (let i = 0; i < 5; i++) {
+                    const [s0, s1] = sectionRange(i, cyc);
+                    const lo = Math.max(wyA, s0);
+                    const hi = Math.min(wyB, s1);
+                    if (hi > lo) out.push({ i, cyc, lo, hi, s0, s1 });
+                }
+            }
+            return out;
+        }
+        function ensureSceneElements() {
+            const wyTop = worldYOf(-120), wyBot = worldYOf(H + 120);
+            const ranges = visibleSectionRanges(wyBot, wyTop);
+            const wxL = worldXOf(-200), wxR = worldXOf(W + 200);
+            for (const r of ranges) {
+                const key = r.cyc * 5 + r.i;
+                if (elemPool.has(key)) continue;
+                const e = { ocean: null, stars: null, snow: null };
+                const lo = r.s0 + EDGE_MARGIN;
+                const hi = r.s1 - EDGE_MARGIN;
+                if (hi > lo) {
+                    const name = SECTIONS[r.i].name;
+                    if (name === '海洋') {
+                        const area = (hi - lo) * (wxR - wxL);
+                        const count = Math.floor(area * OCEAN_DENSITY);
+                        const arr = [];
+                        for (let n = 0; n < count; n++) {
+                            arr.push({
+                                wx: wxL + Math.random() * (wxR - wxL),
+                                wy: lo + Math.random() * (hi - lo),
+                                vx: 0, vy: 0, sxo: 0, syo: 0,
+                                lastSx: null, lastSy: null,
+                                phase: Math.random() * 6.283,
+                                size: 0.9 + Math.random() * 1.9,
+                                bright: 0.5 + Math.random() * 0.5
+                            });
+                        }
+                        e.ocean = arr;
+                    } else if (name === '星空') {
+                        const count = Math.floor(W * ((hi - lo) / K) / 2600);
+                        const arr = [];
+                        for (let n = 0; n < count; n++) {
+                            arr.push({
+                                wx: wxL + Math.random() * (wxR - wxL),
+                                wy: lo + Math.random() * (hi - lo),
+                                size: 0.7 + Math.random() * 2.6,
+                                bright: 0.45 + Math.random() * 0.55,
+                                phase: Math.random() * 6.283,
+                                tw: 0.6 + Math.random() * 1.6
+                            });
+                        }
+                        e.stars = arr;
+                    } else if (name === '冰原') {
+                        const area = (hi - lo) * (wxR - wxL);
+                        const count = Math.floor(area * SNOW_DENSITY);
+                        const arr = [];
+                        for (let n = 0; n < count; n++) {
+                            arr.push({
+                                wx: wxL + Math.random() * (wxR - wxL),
+                                wy: lo + Math.random() * (hi - lo),
+                                size: 1.2 + Math.pow(Math.random(), 2.5) * 4.2,
+                                rot: Math.random() * Math.PI * 2,
+                                spin: (Math.random() - 0.5) * 0.004,
+                                fall: 0.25 + Math.random() * 0.85,
+                                phase: Math.random() * 6.283,
+                                tw: 0.7 + Math.random() * 1.4,
+                                type: Math.random() < 0.35 ? 6 : (3 + Math.floor(Math.random() * 4)),
+                                driftX: (Math.random() - 0.5) * 0.25
+                            });
+                        }
+                        e.snow = arr;
+                    }
+                }
+                elemPool.set(key, e);
+            }
+            // 回收离开可见范围的段
+            for (const key of elemPool.keys()) {
+                const cyc = Math.floor(key / 5), i = key % 5;
+                const [s0, s1] = sectionRange(i, cyc);
+                if (s1 < wyTop - 200 || s0 > wyBot + 200) elemPool.delete(key);
+            }
+        }
+
+        // 海洋光点：缓慢水面浮动（无飞鸟推力），只在海洋段内绘制
+        function updateOcean() {
+            const now = Date.now();
+            ensureSceneElements();
+            const wyTop = worldYOf(-120), wyBot = worldYOf(H + 120);
+            for (const r of visibleSectionRanges(wyBot, wyTop)) {
+                if (SECTIONS[r.i].name !== '海洋') continue;
+                const e = elemPool.get(r.cyc * 5 + r.i);
+                if (!e || !e.ocean) continue;
+                for (const p of e.ocean) {
+                    const amp = 6 + p.size * 1.6;
+                    p.sxo = Math.sin(now * 0.00055 + p.phase) * amp;
+                    p.syo = Math.cos(now * 0.00080 + p.phase * 1.3) * amp * 0.7;
+                }
+            }
+        }
+
+        function drawOcean() {
+            const now = Date.now();
+            ctx.save();
+            const wyTop = worldYOf(-120), wyBot = worldYOf(H + 120);
+            for (const r of visibleSectionRanges(wyBot, wyTop)) {
+                if (SECTIONS[r.i].name !== '海洋') continue;
+                const e = elemPool.get(r.cyc * 5 + r.i);
+                if (!e || !e.ocean) continue;
+                const lo = r.s0 + EDGE_MARGIN, hi = r.s1 - EDGE_MARGIN;
+                const span = Math.max(hi - lo, 1);
+                for (const p of e.ocean) {
+                    const sx = screenXOf(p.wx) + p.sxo;
+                    const sy = screenYOf(p.wy) + p.syo;
+                    if (sx < -14 || sx > W + 14 || sy < -14 || sy > H + 14) { p.lastSx = null; continue; }
+                    const u = (p.wy - lo) / span;
+                    const edge = smoothstep(0, 0.10, u) * smoothstep(1, 0.90, u);
+                    const tw = 0.72 + 0.28 * Math.sin(now * 0.001 + p.phase);
+                    const a = p.bright * tw * 0.92 * edge;
+                    if (a <= 0.01) { p.lastSx = null; continue; }
+                    const sp = Math.hypot(p.vx, p.vy);
+                    if (p.lastSx !== null && sp > 0.4) {
+                        const ddx = sx - p.lastSx, ddy = sy - p.lastSy;
+                        if (ddx * ddx + ddy * ddy > 0.6) {
+                            const ta = Math.min(0.6, sp * 0.06) * a;
+                            ctx.strokeStyle = `rgba(255,255,255,${ta})`;
+                            ctx.lineWidth = 1.1;
+                            ctx.beginPath();
+                            ctx.moveTo(p.lastSx, p.lastSy);
+                            ctx.lineTo(sx, sy);
+                            ctx.stroke();
+                        }
+                    }
+                    p.lastSx = sx; p.lastSy = sy;
+                    const len = (p.size * 2.4 + 1.6) * (1 + Math.min(sp * 0.06, 0.6));
+                    ctx.strokeStyle = `rgba(255,255,255,${a})`;
+                    ctx.lineWidth = Math.max(0.7, p.size * 0.45);
+                    ctx.beginPath();
+                    ctx.moveTo(sx - len, sy); ctx.lineTo(sx + len, sy);
+                    ctx.moveTo(sx, sy - len); ctx.lineTo(sx, sy + len);
+                    ctx.stroke();
+                    ctx.fillStyle = `rgba(255,255,255,${Math.min(1, a * 1.25)})`;
+                    ctx.beginPath();
+                    ctx.arc(sx, sy, Math.max(0.6, p.size * 0.5), 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+            ctx.restore();
+        }
+
+        // 星空：十字星芒 + 微闪，只在星空段绘制
+        function drawStarsLayer() {
+            const now = Date.now();
+            ctx.save();
+            const wyTop = worldYOf(-120), wyBot = worldYOf(H + 120);
+            for (const r of visibleSectionRanges(wyBot, wyTop)) {
+                if (SECTIONS[r.i].name !== '星空') continue;
+                const e = elemPool.get(r.cyc * 5 + r.i);
+                if (!e || !e.stars) continue;
+                for (const s of e.stars) {
+                    const sx = screenXOf(s.wx), sy = screenYOf(s.wy);
+                    if (sx < -10 || sx > W + 10 || sy < -10 || sy > H + 10) continue;
+                    const tw = 0.55 + 0.45 * Math.sin(now * 0.0012 * s.tw + s.phase);
+                    const a = s.bright * tw;
+                    const len = s.size * 2.4 + 1.2;
+                    ctx.strokeStyle = `rgba(255,255,255,${a})`;
+                    ctx.lineWidth = Math.max(0.6, s.size * 0.4);
+                    ctx.beginPath();
+                    ctx.moveTo(sx - len, sy); ctx.lineTo(sx + len, sy);
+                    ctx.moveTo(sx, sy - len); ctx.lineTo(sx, sy + len);
+                    ctx.stroke();
+                    ctx.fillStyle = `rgba(255,255,255,${Math.min(1, a * 1.2)})`;
+                    ctx.beginPath();
+                    ctx.arc(sx, sy, Math.max(0.5, s.size * 0.5), 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+            ctx.restore();
+        }
+
+        // 冰原雪花：飘落 + 旋转，只在本段冰原内循环（落到底部回到顶部），不再越界到草原
+        function drawSnowLayer() {
+            const now = Date.now();
+            ctx.save();
+            ctx.globalCompositeOperation = 'screen';
+            const wyTop = worldYOf(-120), wyBot = worldYOf(H + 120);
+            const wxL = worldXOf(-200), wxR = worldXOf(W + 200);
+            for (const r of visibleSectionRanges(wyBot, wyTop)) {
+                if (SECTIONS[r.i].name !== '冰原') continue;
+                const e = elemPool.get(r.cyc * 5 + r.i);
+                if (!e || !e.snow) continue;
+                const lo = r.s0 + EDGE_MARGIN, hi = r.s1 - EDGE_MARGIN;
+                for (const s of e.snow) {
+                    s.wy -= s.fall;
+                    if (s.wy < lo) { s.wy = hi; s.wx = wxL + Math.random() * (wxR - wxL); }
+                    s.wx += s.driftX + Math.sin(now * 0.0008 + s.phase) * 0.15;
+                    s.rot += s.spin;
+                    const sx = screenXOf(s.wx), sy = screenYOf(s.wy);
+                    if (sx < -20 || sx > W + 20 || sy < -20 || sy > H + 20) continue;
+                    const tw = 0.35 + 0.65 * Math.sin(now * 0.0011 * s.tw + s.phase);
+                    const a = 0.75 * tw;
+                    const c = Math.cos(s.rot), sn = Math.sin(s.rot);
+                    ctx.strokeStyle = `rgba(255,255,255,${a})`;
+                    ctx.fillStyle = `rgba(255,255,255,${Math.min(1, a * 1.15)})`;
+                    if (s.type === 6) {
+                        const r2 = s.size * 2.8;
+                        ctx.lineWidth = Math.max(0.5, s.size * 0.24);
+                        for (let i = 0; i < 6; i++) {
+                            const base = i * Math.PI / 3;
+                            const a0 = base, a1 = base - 0.45, a2 = base + 0.45;
+                            ctx.beginPath();
+                            ctx.moveTo(sx, sy);
+                            ctx.lineTo(sx + (Math.cos(a0) * c - Math.sin(a0) * sn) * r2, sy + (Math.sin(a0) * c + Math.cos(a0) * sn) * r2);
+                            ctx.stroke();
+                            const br = r2 * 0.32;
+                            ctx.beginPath();
+                            ctx.moveTo(sx + (Math.cos(a1) * c - Math.sin(a1) * sn) * br, sy + (Math.sin(a1) * c + Math.cos(a1) * sn) * br);
+                            ctx.lineTo(sx + (Math.cos(a0) * c - Math.sin(a0) * sn) * (br * 1.4), sy + (Math.sin(a0) * c + Math.cos(a0) * sn) * (br * 1.4));
+                            ctx.lineTo(sx + (Math.cos(a2) * c - Math.sin(a2) * sn) * br, sy + (Math.sin(a2) * c + Math.cos(a2) * sn) * br);
+                            ctx.stroke();
+                        }
+                    } else {
+                        ctx.beginPath();
+                        ctx.arc(sx, sy, s.size * 0.6, 0, Math.PI * 2);
+                        ctx.fill();
+                        const len = s.size * 1.6;
+                        ctx.lineWidth = Math.max(0.4, s.size * 0.2);
+                        for (let i = 0; i < s.type; i++) {
+                            const a0 = s.rot + i * (Math.PI * 2 / s.type);
+                            ctx.beginPath();
+                            ctx.moveTo(sx, sy);
+                            ctx.lineTo(sx + Math.cos(a0) * len, sy + Math.sin(a0) * len);
+                            ctx.stroke();
+                        }
+                    }
+                }
+            }
+            ctx.restore();
+        }
+
+        // ===== 冰原→星空：极高的冰山（峰顶越界进入星空，山脚沉入冰原） =====
+        const MTN_PEAK_H = 2200;   // 峰顶越界进入星空的高度（世界单位）
+        const MTN_BASE_D = 1500;   // 山脚沉入冰原的深度（世界单位）
+        function drawIceMountain() {
+            const wyNow = worldYOf(player.screenY);
+            const stepM = CYCLE_WORLD;
+            const baseM = SEC_CUM[4];
+            const mNear = Math.round((wyNow - baseM) / stepM);
+            for (let m = mNear - 1; m <= mNear + 1; m++) {
+                drawOneMountain(baseM + m * stepM, m);
+            }
+        }
+        function drawOneMountain(borderY, m) {
+            const cx = W * 0.5 + (hash2(m * 1.7, 3.3) - 0.5) * W * 0.12;
+            const peakY = screenYOf(borderY + MTN_PEAK_H);
+            const baseY = screenYOf(borderY - MTN_BASE_D);
+            if (baseY < -260 && peakY < -260) return;
+            if (baseY > H + 260 && peakY > H + 260) return;
+            const halfW = W * 0.32;              // 单峰宽度：壮阔但不遮挡两侧
+            const L = (a, b, t) => a + (b - a) * t;
+            const R = (n, mag) => (hash2(m, n * 1.618) - 0.5) * mag;
+            const peakX = R(5.5, W * 0.08);
+            // 更崎岖的山脊线
+            const sil = [
+                [cx - halfW, baseY],
+                [cx - halfW * 0.78, L(baseY, peakY, 0.30) + R(1.1, 90)],
+                [cx - halfW * 0.55, L(baseY, peakY, 0.48) + R(1.2, 70)],
+                [cx - halfW * 0.30, L(baseY, peakY, 0.62) + R(1.3, 85)],
+                [cx - halfW * 0.10, L(baseY, peakY, 0.82) + R(1.4, 65)],
+                [cx + peakX, peakY],
+                [cx + halfW * 0.12, L(baseY, peakY, 0.80) + R(1.5, 75)],
+                [cx + halfW * 0.42, L(baseY, peakY, 0.56) + R(1.6, 90)],
+                [cx + halfW * 0.70, L(baseY, peakY, 0.34) + R(1.7, 60)],
+                [cx + halfW, baseY]
+            ];
+            ctx.save();
+            // 山体主体（雪白→冰蓝竖向渐变）
+            ctx.beginPath();
+            ctx.moveTo(sil[0][0], sil[0][1]);
+            for (let i = 1; i < sil.length; i++) ctx.lineTo(sil[i][0], sil[i][1]);
+            ctx.closePath();
+            const g = ctx.createLinearGradient(0, peakY, 0, baseY);
+            g.addColorStop(0, 'rgba(248,252,255,1)');
+            g.addColorStop(0.45, 'rgba(214,235,248,1)');
+            g.addColorStop(0.72, 'rgba(160,198,222,1)');
+            g.addColorStop(1, 'rgba(125,170,200,0)');   // 山脚渐隐入冰原地面，无硬边
+            ctx.fillStyle = g;
+            ctx.fill();
+            // 右侧阴影面（从主峰到右底）
+            ctx.beginPath();
+            ctx.moveTo(cx + peakX, peakY);
+            ctx.lineTo(sil[6][0], sil[6][1]);
+            ctx.lineTo(sil[7][0], sil[7][1]);
+            ctx.lineTo(sil[8][0], sil[8][1]);
+            ctx.lineTo(cx + halfW, baseY);
+            ctx.lineTo(cx, baseY);
+            ctx.closePath();
+            const sg = ctx.createLinearGradient(0, peakY, 0, baseY);
+            sg.addColorStop(0, 'rgba(70,108,138,0.42)');
+            sg.addColorStop(0.72, 'rgba(70,108,138,0.42)');
+            sg.addColorStop(1, 'rgba(70,108,138,0)');   // 山脚随山体一同渐隐
+            ctx.fillStyle = sg;
+            ctx.fill();
+            // 左侧高光
+            ctx.beginPath();
+            ctx.moveTo(cx + peakX, peakY);
+            ctx.lineTo(sil[4][0], sil[4][1]);
+            ctx.lineTo(sil[3][0], sil[3][1]);
+            ctx.lineTo(sil[2][0], sil[2][1]);
+            ctx.lineTo(sil[1][0], sil[1][1]);
+            ctx.lineTo(cx - halfW, baseY);
+            ctx.lineTo(cx, baseY);
+            ctx.closePath();
+            const hg = ctx.createLinearGradient(0, peakY, 0, baseY);
+            hg.addColorStop(0, 'rgba(255,255,255,0.22)');
+            hg.addColorStop(0.72, 'rgba(255,255,255,0.22)');
+            hg.addColorStop(1, 'rgba(255,255,255,0)');   // 山脚随山体一同渐隐
+            ctx.fillStyle = hg;
+            ctx.fill();
+            // 主脊高光线
+            ctx.beginPath();
+            ctx.moveTo(cx + peakX, peakY);
+            ctx.lineTo(cx, baseY);
+            const rg2 = ctx.createLinearGradient(0, peakY, 0, baseY);
+            rg2.addColorStop(0, 'rgba(255,255,255,0.6)');
+            rg2.addColorStop(0.72, 'rgba(255,255,255,0.5)');
+            rg2.addColorStop(1, 'rgba(255,255,255,0)');   // 山脚随山体一同渐隐
+            ctx.strokeStyle = rg2;
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            // 峰顶微光（越界到星空更明显）
+            const rg = ctx.createRadialGradient(cx + peakX, peakY, 2, cx + peakX, peakY, 90);
+            rg.addColorStop(0, 'rgba(255,255,255,0.65)');
+            rg.addColorStop(1, 'rgba(255,255,255,0)');
+            ctx.fillStyle = rg;
+            ctx.beginPath();
+            ctx.arc(cx + peakX, peakY, 90, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+        }
+
+        // ===== 草原小花（仅玩家触发） =====
+        const FLOWER_COLORS = ['#ff7eb6', '#ffd166', '#ffffff', '#c08bff', '#ff8c42', '#7ee8fa', '#ff5d8f'];
+        const flowers = [];
+        function spawnFlower(wx, wy) {
+            if (flowers.length > 160) flowers.shift();
+            flowers.push({
+                wx, wy,
+                color: FLOWER_COLORS[(Math.random() * FLOWER_COLORS.length) | 0],
+                bloom: 0,
+                layer: Math.random() < 0.5 ? 0 : 1,
+                size: 4 + Math.random() * 4.5,
+                phase: Math.random() * 6.283
+            });
+        }
+        function drawFlower(f) {
+            const sec = SECTIONS[sceneIndexAt(f.wy)];
+            if (sec.name !== '草原') return;
+            const sx = screenXOf(f.wx), sy = screenYOf(f.wy);
+            if (sx < -20 || sx > W + 20 || sy < -20 || sy > H + 20) return;
+            const b = f.bloom;
+            if (b <= 0) return;
+            const sway = Math.sin(Date.now() * 0.0008 + f.phase) * 2.2 * b;
+            const topX = sx + sway, topY = sy - f.size * 1.6 * b;
+            ctx.strokeStyle = 'rgba(30,80,30,0.55)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(sx, sy);
+            ctx.quadraticCurveTo(sx + sway * 0.5, (sy + topY) / 2, topX, topY);
+            ctx.stroke();
+            const r = f.size * b;
+            ctx.fillStyle = f.color;
+            for (let p = 0; p < 5; p++) {
+                const a = f.phase + p * (Math.PI * 2 / 5);
+                const px = topX + Math.cos(a) * r * 0.9;
+                const py = topY + Math.sin(a) * r * 0.9;
+                ctx.beginPath();
+                ctx.ellipse(px, py, r * 0.55, r * 0.38, a, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            ctx.fillStyle = 'rgba(255,224,130,0.95)';
+            ctx.beginPath();
+            ctx.arc(topX, topY, r * 0.42, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        function drawFlowers() {
+            for (const f of flowers) if (f.layer === 0) drawFlower(f);
+            for (const f of flowers) if (f.layer === 1) drawFlower(f);
+        }
+
+        // ===== 绘制：飞鸟形象（头朝上、旋转拍翅） =====
+        function drawBird(x, y, size, wingSpan, flap, color, alpha = 1, pitch = 0, glide = 0) {
+            const wingPhase = Math.sin(flap);
+            const wingAngle = 0.28 + wingPhase * 0.24 * (1.0 - 0.5 * glide);
+            const bodyLen = size;
+            const wingLen = wingSpan * 0.5;
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.translate(x, y);
+            ctx.rotate(pitch);
+            ctx.fillStyle = color;
+            ctx.strokeStyle = color;
+            ctx.lineJoin = 'round';
+            ctx.lineCap = 'round';
+            if (alpha >= 1) { ctx.shadowColor = 'rgba(0,0,0,0.18)'; ctx.shadowBlur = 6; }
+            ctx.beginPath();
+            ctx.moveTo(0, -bodyLen);
+            ctx.lineTo(-bodyLen * 0.22, bodyLen * 0.18);
+            ctx.lineTo(bodyLen * 0.22, bodyLen * 0.18);
+            ctx.closePath();
+            ctx.fill();
+            ctx.save();
+            ctx.rotate(-wingAngle);
+            ctx.beginPath();
+            ctx.moveTo(0, -bodyLen * 0.1);
+            ctx.quadraticCurveTo(-wingLen * 0.5, -wingLen * 0.2, -wingLen, wingLen * 0.05);
+            ctx.quadraticCurveTo(-wingLen * 0.5, wingLen * 0.1, 0, wingLen * 0.15);
+            ctx.closePath();
+            ctx.fill();
+            ctx.restore();
+            ctx.save();
+            ctx.rotate(wingAngle);
+            ctx.beginPath();
+            ctx.moveTo(0, -bodyLen * 0.1);
+            ctx.quadraticCurveTo(wingLen * 0.5, -wingLen * 0.2, wingLen, wingLen * 0.05);
+            ctx.quadraticCurveTo(wingLen * 0.5, wingLen * 0.1, 0, wingLen * 0.15);
+            ctx.closePath();
+            ctx.fill();
+            ctx.restore();
+            ctx.restore();
+        }
+
+        function drawTail(x, y, size, tailPhase, dragX, dragY, color, alpha = 1) {
+            const baseY = y + size * 0.22;
+            const tipX = x + dragX;
+            const tipY = y + size * 2.4 + dragY;
+            const sway = Math.sin(tailPhase) * size * 0.7;
+            const strands = 3;
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.lineCap = 'round';
+            for (let s = 0; s < strands; s++) {
+                const off = (s - (strands - 1) / 2) * size * 0.16;
+                const tipOff = off * 1.8 + sway * (s === 1 ? 1 : 0.45);
+                const midX = x + off * 0.5 + dragX * 0.55;
+                const midY = baseY + size * 1.15 + dragY * 0.55;
+                ctx.strokeStyle = color;
+                ctx.lineWidth = size * 0.07;
+                ctx.beginPath();
+                ctx.moveTo(x + off, baseY);
+                ctx.quadraticCurveTo(midX, midY, tipX + tipOff, tipY);
+                ctx.stroke();
+            }
+            ctx.restore();
+        }
+
+        // 鸟形暗影：与飞鸟同步拍翅，画在右下方（离鸟更远）
+        function drawBirdSilhouette(x, y, size, wingSpan, flap, glide, alpha) {
+            const wingPhase = Math.sin(flap);
+            const wingAngle = 0.28 + wingPhase * 0.24 * (1.0 - 0.5 * glide);
+            const bodyLen = size, wingLen = wingSpan * 0.5;
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.translate(x, y);
+            ctx.fillStyle = '#000';
+            ctx.strokeStyle = '#000';
+            ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(0, -bodyLen);
+            ctx.lineTo(-bodyLen * 0.22, bodyLen * 0.18);
+            ctx.lineTo(bodyLen * 0.22, bodyLen * 0.18);
+            ctx.closePath(); ctx.fill();
+            ctx.save(); ctx.rotate(-wingAngle);
+            ctx.beginPath(); ctx.moveTo(0, -bodyLen * 0.1);
+            ctx.quadraticCurveTo(-wingLen * 0.5, -wingLen * 0.2, -wingLen, wingLen * 0.05);
+            ctx.quadraticCurveTo(-wingLen * 0.5, wingLen * 0.1, 0, wingLen * 0.15);
+            ctx.closePath(); ctx.fill(); ctx.restore();
+            ctx.save(); ctx.rotate(wingAngle);
+            ctx.beginPath(); ctx.moveTo(0, -bodyLen * 0.1);
+            ctx.quadraticCurveTo(wingLen * 0.5, -wingLen * 0.2, wingLen, wingLen * 0.05);
+            ctx.quadraticCurveTo(wingLen * 0.5, wingLen * 0.1, 0, wingLen * 0.15);
+            ctx.closePath(); ctx.fill(); ctx.restore();
+            ctx.restore();
+        }
+        function drawShadow(x, y, size, wingSpan, flap, glide) {
+            const offX = size * 0.75, offY = size * 1.2;   // 影子在右下方、离鸟更远
+            drawBirdSilhouette(x + offX, y + offY, size * 0.9, wingSpan, flap || 0, glide || 0, 0.16);
+        }
+
+        function drawTrail(bird) {
+            if (bird.trail.length < 2) return;
+            ctx.save();
+            for (let i = 1; i < bird.trail.length; i++) {
+                const cur = bird.trail[i], prev = bird.trail[i - 1];
+                const a = (i / bird.trail.length) * 0.4;
+                ctx.strokeStyle = `rgba(255,255,255,${a})`;
+                ctx.lineWidth = 3 * (i / bird.trail.length);
+                ctx.lineCap = 'round';
+                ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(cur.x, cur.y); ctx.stroke();
+            }
+            ctx.restore();
+        }
+
+        function drawWaves() {
+            for (const w of waves) {
+                ctx.save();
+                ctx.strokeStyle = w.fromPlayer ? `rgba(255,255,255,${w.a})` : `rgba(255,235,180,${w.a})`;
+                ctx.lineWidth = 2.5;
+                ctx.beginPath(); ctx.arc(w.x, w.y, w.r, 0, Math.PI * 2); ctx.stroke();
+                ctx.lineWidth = 1.2;
+                ctx.beginPath(); ctx.arc(w.x, w.y, w.r * 0.7, 0, Math.PI * 2); ctx.stroke();
+                ctx.restore();
+            }
+        }
+
+        // ===== Boids 更新同伴 =====
+        function updateCompanions() {
+            const targetX = player.screenX;
+            const targetY = player.screenY + 110;
+            for (let i = 0; i < companions.length; i++) {
+                const b = companions[i];
+                if (b.baseWing === undefined) b.baseWing = b.wingSpeed;
+                const vUp = -b.vy;   // 屏幕向上(负vy) = 向上飞
+                const tw = b.baseWing + clamp(vUp * 0.012, -0.05, 0.06);
+                b.wingSpeed += (tw - b.wingSpeed) * 0.1;
+                b.flap += b.wingSpeed;
+                b.tailPhase += b.tailSpeed;
+
+                let sepX = 0, sepY = 0, sepN = 0;
+                let aliX = 0, aliY = 0, aliN = 0;
+                let cohX = 0, cohY = 0, cohN = 0;
+                for (let j = 0; j < companions.length; j++) {
+                    if (i === j) continue;
+                    const o = companions[j];
+                    const dx = b.x - o.x, dy = b.y - o.y;
+                    const d = Math.hypot(dx, dy);
+                    if (d < 1) continue;
+                    if (d < 130) { sepX += dx / d; sepY += dy / d; sepN++; }
+                    if (d < 260) { aliX += o.vx; aliY += o.vy; aliN++; }
+                    if (d < 260) { cohX += o.x; cohY += o.y; cohN++; }
+                }
+
+                let ax = 0, ay = 0;
+                if (sepN) { ax += (sepX / sepN) * 0.38; ay += (sepY / sepN) * 0.38; }
+                if (aliN) { ax += ((aliX / aliN) - b.vx) * 0.018; ay += ((aliY / aliN) - b.vy) * 0.018; }
+                if (cohN) { ax += ((cohX / cohN) - b.x) * 0.0025; ay += ((cohY / cohN) - b.y) * 0.0025; }
+
+                const dx = targetX - b.x, dy = targetY - b.y;
+                const d = Math.hypot(dx, dy);
+                if (d > 1) { ax += (dx / d) * 0.055; ay += (dy / d) * 0.055; }
+
+                if (b.y < player.screenY - 50) {
+                    const front = (player.screenY - 50) - b.y;
+                    ay += front * 0.008;
+                }
+
+                b.vx += ax;
+                b.vy += ay;
+                const maxV = 6.2;
+                const sp = Math.hypot(b.vx, b.vy);
+                if (sp > maxV) { b.vx = b.vx / sp * maxV; b.vy = b.vy / sp * maxV; }
+                b.vx *= 0.94;
+                b.vy *= 0.94;
+                b.x += b.vx;
+                b.y += b.vy;
+
+                if (b.x < -50) b.x = W + 50;
+                if (b.x > W + 50) b.x = -50;
+                if (b.y < -80) b.y = H + 80;
+                if (b.y > H + 80) b.y = -80;
+
+                const tb = clamp(b.vx * 0.04, -0.4, 0.4);
+                b.bank += (tb - b.bank) * 0.1;
+
+                if (b.replyTimer > 0) {
+                    b.replyTimer -= 1 / 60;
+                    if (b.replyTimer <= 0) {
+                        playBirdSong(1.2 + Math.random() * 0.3, 0);
+                        waves.push({ x: b.x, y: b.y - b.size, r: 0, a: 0.9, life: 0.9, fromPlayer: false });
+                    }
+                }
+            }
+        }
+
+        // ===== 主循环 =====
+        let started = false;
+        function update() {
+            scroll += AUTO_SPEED;
+
+            // ===== 雪山攀升：根据飞鸟与「冰原→星空」冰山边界的距离，
+            //        驱动变大(贴近镜头)/仰头/加快拍翅；越过进入星空后滑翔并缓缓复原 =====
+            const wyNow = worldYOf(player.screenY);
+            const stepM = CYCLE_WORLD;
+            const baseM = SEC_CUM[4];          // 冰原→星空 边界 world Y
+            const APPROACH = 1700, RECOVER = 2200;    // 攀升区/恢复期（世界单位）
+            const mNear = Math.round((wyNow - baseM) / stepM);
+            let climb = 0, glide = 0;
+            for (let m = mNear - 1; m <= mNear + 1; m++) {
+                const borderY = baseM + m * stepM;
+                const d = borderY - wyNow;            // >0：仍在冰原(下方)接近中； <0：已进入星空(上方)
+                let c = (d >= 0) ? (1 - clamp(d / APPROACH, 0, 1))
+                                : (1 - clamp(-d / RECOVER, 0, 1));
+                if (c > climb) climb = c;
+                if (d < 0) { const g = clamp(-d / RECOVER, 0, 1); if (g > glide) glide = g; }
+            }
+            player.climb = climb;
+            player.glide = glide;
+            let targetWing = 0.10 + climb * 0.13;   // 正常 0.10 → 攀峰约 0.23
+            const targetSize = 1 + climb * 0.9;       // 正常 1.0 → 攀峰约 1.9（贴近镜头）
+            const targetPitch = climb * -0.15;        // 仰头：逆时针(头后仰)倾转
+            // 操作拍翅：上飞加速、下飞减速、纯左右则滑翔不振翅
+            let ctrlGlide = 0;
+            if (keys.up && !keys.down) targetWing += 0.07;
+            else if (keys.down && !keys.up) targetWing = Math.max(0.03, targetWing - 0.05);
+            if ((keys.left || keys.right) && !keys.up && !keys.down) { ctrlGlide = 1; targetWing = Math.min(targetWing, 0.02); }
+            player.wingSpeed += (targetWing - player.wingSpeed) * 0.08;
+            player.ctrlGlide += (ctrlGlide - player.ctrlGlide) * 0.1;
+
+            player.update();
+
+            player.sizeScale += (targetSize - player.sizeScale) * 0.05;
+            player.pitch += (targetPitch - player.pitch) * 0.05;
+
+            updateOcean();
+            updateCompanions();
+
+            const wy = worldYOf(player.screenY);
+            if (SECTIONS[sceneIndexAt(wy)].name === '草原' && Math.random() < 0.35) {
+                spawnFlower(worldXOf(player.screenX + (Math.random() - 0.5) * 16), wy + (Math.random() - 0.5) * 60);
+            }
+            for (let i = flowers.length - 1; i >= 0; i--) {
+                flowers[i].bloom = Math.min(1, flowers[i].bloom + 0.013);
+            }
+
+            for (let i = waves.length - 1; i >= 0; i--) {
+                const w = waves[i];
+                w.r += 4.8;
+                w.life -= 0.013;
+                w.a = Math.max(0, w.life);
+                if (w.life <= 0) { waves.splice(i, 1); continue; }
+                if (w.fromPlayer) {
+                    for (const b of companions) {
+                        const dx = b.x - w.x, dy = b.y - w.y;
+                        const d = Math.hypot(dx, dy);
+                        if (Math.abs(d - w.r) < 16 && b.replyTimer <= 0) {
+                            b.replyTimer = 0.4 + Math.random() * 0.5;
+                        }
+                    }
+                }
+            }
+        }
+
+        function draw2D() {
+            ctx.clearRect(0, 0, W, H);
+            drawOcean();
+            drawFlowers();
+            drawStarsLayer();
+            drawSnowLayer();
+            drawIceMountain();
+
+            for (const b of companions) drawShadow(b.x, b.y, b.size, b.wingSpan, b.flap, 0);
+            drawShadow(player.screenX, player.screenY, player.size * player.sizeScale, player.wingSpan * player.sizeScale, player.flap, player.glide + player.ctrlGlide);
+
+            for (const b of companions) {
+                drawTail(b.x, b.y, b.size, b.tailPhase, -b.vx * 1.4, -b.vy * 1.4, b.color, 1);
+                drawBird(b.x, b.y, b.size, b.wingSpan, b.flap, b.color, 1, b.bank);
+            }
+
+            drawTrail(player);
+            ctx.save();
+            ctx.translate(player.screenX, player.screenY);
+            ctx.rotate(player.pitch + player.bank);
+            const ps = player.sizeScale;
+            ctx.scale(ps, ps);
+            drawTail(0, 0, player.size, player.tailPhase, player.dragX / ps, player.dragY / ps, '#ffffff', 1);
+            drawBird(0, 0, player.size, player.wingSpan, player.flap, '#ffffff', 1, 0, player.glide + player.ctrlGlide);
+            ctx.restore();
+
+            drawWaves();
+
+            const wy = worldYOf(player.screenY);
+            const sec = SECTIONS[sceneIndexAt(wy)];
+            ctx.save();
+            ctx.fillStyle = sec.name === '星空' ? 'rgba(255,255,255,0.5)' : 'rgba(255,255,255,0.72)';
+            ctx.font = '300 20px "PingFang SC", "Microsoft YaHei", sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(sec.name, W / 2, H - 40);
+            ctx.restore();
+        }
+
+        function loop() {
+            if (!started) return;
+            update();
+            const now = performance.now() * 0.001;
+            bgMat.uniforms.uTime.value = now;
+            bgMat.uniforms.uScroll.value = scroll;
+            grassMat.uniforms.uTime.value = now;
+            grassMat.uniforms.uScroll.value = scroll;
+            updateGrass();
+            renderer3d.render(scene3d, camera3d);
+            draw2D();
+            requestAnimationFrame(loop);
+        }
+
+        startBtn.addEventListener('click', () => {
+            ensureAudio();
+            started = true;
+            const sp = new URLSearchParams(location.search);
+            if (sp.get('scroll')) scroll = parseFloat(sp.get('scroll'));
+            overlay.style.opacity = '0';
+            setTimeout(() => overlay.style.display = 'none', 500);
+            loop();
+            setTimeout(() => player.chime(), 400);
+            setTimeout(() => hint.style.opacity = '0', 6000);
+        });
+
+        // 自动开始（供无头测试）
+        if (new URLSearchParams(location.search).get('autostart') === '1') {
+            setTimeout(() => startBtn.click(), 300);
+        }
+
+        // 本地启动联动：页面关闭通知服务，心跳保持连接
+        if (new URLSearchParams(location.search).get('server') === '1') {
+            window.addEventListener('beforeunload', () => {
+                if (navigator.sendBeacon) navigator.sendBeacon('/__close');
+            });
+            setInterval(() => {
+                fetch('/__ping', { method: 'POST', keepalive: true }).catch(() => {});
+            }, 2000);
+        }
+
+        // 开场先画一帧静态预览
+        initThree();
+        bgMat.uniforms.uScroll.value = 0;
+        grassMat.uniforms.uScroll.value = 0;
+        updateGrass();
+        renderer3d.render(scene3d, camera3d);
+        draw2D();
+    })();
+    </script>
+</body>
+</html>

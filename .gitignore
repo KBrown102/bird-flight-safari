@@ -1,0 +1,4 @@
+.browser_tmp/
+.workbuddy/
+node_modules/
+*.log
